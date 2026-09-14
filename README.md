@@ -11,7 +11,7 @@ bus-neutral contracts in [`hwcore`](https://github.com/Tape-Out/hwcore), assembl
 
 ## Status
 
-Planned. The entry in [`index`](https://github.com/Tape-Out/index) tracks what lands when.
+Planned, not started. Work starts when cores and memory need an interconnect other than a bus.
 
 ## License
 
