@@ -1,0 +1,33 @@
+name: noc
+version: 0.1.0
+spec: '0.1'
+kind: library
+lang: bh
+identity:
+  slug: noc-tapeout-bsv
+  display_name: Network on chip
+  summary: Single-flit packet routers and networks built from a topology type 
+    class, with a deadlock-free mesh and a point-to-point link.
+  category: infrastructure
+  maturity: simulated
+deps:
+  hwcore: ^0.1
+area:
+  probe:
+    module: mkMeshProbe
+    src: tb/Probe.bsv
+    check: true
+  base:
+    fixed: 29655.47
+  model: single-point
+  error:
+    bound: 0.05
+    sign: over
+    note: 'the probe is a 2x2 mesh with 32-bit payloads and every port brought out, measured at 26959.52; synthesis repeats the same RTL within 3 percent, so the price carries a 10 percent margin. A network grows with its node count; this price is for the smallest mesh until an assembly measures one'
+  corner:
+    tool: ecc
+    pdk: ics55
+    freq_mhz: 100
+    measured: '2026-09-16'
+    toolchain: bsc 2026.01 · yosys 0.68+195 · ecc 0.1.0a11
+    gen_digest: sha256:dd5a227e6e37926a

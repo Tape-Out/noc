@@ -1,0 +1,208 @@
+package Noc where
+
+-- 片上网络：单片报文、每口两级缓冲、每个输出口轮转仲裁。拓扑是一个类型类，路由器与网络对它泛型：
+-- 加一种拓扑就是加一个实例，路由器一行不动。
+--
+-- 不死锁的口径：通道依赖图没有环（Dally, Seitz 1987）。网格用维序路由，先走完 X 再走 Y，
+-- 从 Y 转回 X 的弯一个都没有（Glass, Ni 1992），依赖图无环。没有虚通道的环依赖图有环，所以这里不给环。
+
+import FIFOF
+import GetPut
+import Connectable
+import qualified Vector
+import qualified List
+
+data Dir = Local | North | East | South | West
+  deriving (Bits, Eq, FShow)
+
+dirIndex :: Dir -> Integer
+dirIndex Local = 0
+dirIndex North = 1
+dirIndex East  = 2
+dirIndex South = 3
+dirIndex West  = 4
+
+dirOf :: Dir -> UInt 3
+dirOf d = unpack (pack d)
+
+opposite :: Dir -> Dir
+opposite North = South
+opposite South = North
+opposite East  = West
+opposite West  = East
+opposite Local = Local
+
+struct Pkt dw =
+    dest    :: UInt 8
+    src     :: UInt 8
+    payload :: Bit dw
+  deriving (Bits, Eq, FShow)
+
+class Topology t where
+  -- 一共几个节点
+  nodes     :: t -> Integer
+  -- 在节点 here、要去节点 dest，下一步走哪个口；到了就是 Local
+  step      :: t -> Integer -> Integer -> Dir
+  -- 节点 here 的这个口连着哪个节点
+  neighbour :: t -> Integer -> Dir -> Maybe Integer
+
+-- 宽 w、高 h 的网格，节点号按行排：第 y 行第 x 列是 y * w + x
+data (Mesh :: # -> # -> *) w h = Mesh
+
+meshCols :: Mesh w h -> Integer
+meshCols _ = valueOf w
+
+meshRows :: Mesh w h -> Integer
+meshRows _ = valueOf h
+
+instance Topology (Mesh w h) where
+  nodes t = meshCols t * meshRows t
+  step t here dest =
+    let cols = meshCols t
+        hx = here `mod` cols
+        hy = here `div` cols
+        dx = dest `mod` cols
+        dy = dest `div` cols
+    in  if dx > hx then East
+        else if dx < hx then West
+        else if dy > hy then South
+        else if dy < hy then North
+        else Local
+  neighbour t here d =
+    let cols = meshCols t
+        rows = meshRows t
+        x = here `mod` cols
+        y = here `div` cols
+    in  case d of
+          North -> if y > 0 then Just (here - cols) else Nothing
+          South -> if y + 1 < rows then Just (here + cols) else Nothing
+          East  -> if x + 1 < cols then Just (here + 1) else Nothing
+          West  -> if x > 0 then Just (here - 1) else Nothing
+          Local -> Nothing
+
+-- 两个节点一条双向链路：0 号的东口接 1 号的西口
+data P2P = P2P
+
+instance Topology P2P where
+  nodes _ = 2
+  step _ here dest = if here == dest then Local else if here == 0 then East else West
+  neighbour _ here d =
+    case d of
+      East  -> if here == 0 then Just 1 else Nothing
+      West  -> if here == 1 then Just 0 else Nothing
+      _     -> Nothing
+
+interface Router dw =
+    inp  :: Vector.Vector 5 (Put (Pkt dw))
+    outp :: Vector.Vector 5 (Get (Pkt dw))
+
+-- 不带守卫的缓冲给路由器内部用（一条规则里自己看空满），对外包一层带守卫的
+guarded :: FIFOF a -> FIFOF a
+guarded f =
+  interface FIFOF
+    enq x    = f.enq x when f.notFull
+    deq      = f.deq   when f.notEmpty
+    first    = f.first when f.notEmpty
+    clear    = f.clear
+    notFull  = f.notFull
+    notEmpty = f.notEmpty
+
+wrap5 :: UInt 4 -> UInt 3
+wrap5 s = truncate (if s >= 5 then s - 5 else s)
+
+-- 轮转：从 turn 起第一个提出请求的输入
+pickFrom :: Vector.Vector 5 Bool -> UInt 3 -> Maybe (UInt 3)
+pickFrom reqs turn =
+  let order :: Vector.Vector 5 (UInt 3)
+      order = Vector.genWith (\ k -> wrap5 (zeroExtend turn + fromInteger k))
+  in  Vector.find (\ i -> Vector.select reqs i) order
+
+mkRouter :: (IsModule m c, Topology t, Bits (Pkt dw) pw) => t -> Integer -> m (Router dw)
+mkRouter topo here =
+  module
+    inq  :: Vector.Vector 5 (FIFOF (Pkt dw)) <- Vector.replicateM (mkUGSizedFIFOF 2)
+    outq :: Vector.Vector 5 (FIFOF (Pkt dw)) <- Vector.replicateM (mkUGSizedFIFOF 2)
+    turn :: Vector.Vector 5 (Reg (UInt 3))   <- Vector.replicateM (mkReg 0)
+
+    let -- 去节点 d 走哪个口，编译期就算定
+        hop :: Integer -> Dir
+        hop d = if d < nodes topo then step topo here d else Local
+
+        -- 目的号查方向，只按节点数展开；号超出节点数的包交给本地，与原来 256 项表的越界行为相同。
+        -- 原来是 256 项常数表按目的号动态查，而且在 5×5 个 wants 里各展开一次选择器：
+        -- 2×2 网格展开就过了 20 万步（G0024），4×4 会撞 100 万步的上限
+        pick :: UInt 8 -> Integer -> Dir -> Dir
+        pick dest d acc = if dest == fromInteger d then hop d else acc
+
+        dirTo :: UInt 8 -> Dir
+        dirTo dest = List.foldr (pick dest) Local (List.upto 0 (nodes topo - 1))
+
+        -- 每个输入口队头的包去哪个口，一个输入口算一次
+        dirs :: Vector.Vector 5 Dir
+        dirs = Vector.genWith (\ i -> dirTo ((Vector.!!) inq i).first.dest)
+
+        wants :: Integer -> Integer -> Bool
+        wants i o = ((Vector.!!) inq i).notEmpty && dirOf ((Vector.!!) dirs i) == fromInteger o
+
+        -- 每个输出口这一拍选中的输入：输出缓冲有空位才选
+        chosen :: Vector.Vector 5 (Maybe (UInt 3))
+        chosen = Vector.genWith (\ o ->
+                   if ((Vector.!!) outq o).notFull
+                   then pickFrom (Vector.genWith (\ i -> wants i o)) (readReg ((Vector.!!) turn o))
+                   else Nothing)
+
+        granted :: Integer -> Bool
+        granted i = Vector.any (\ c -> c == Just (fromInteger i)) chosen
+
+        -- 输出口 o 从选中的输入搬一个包，轮转指针挪到它后面
+        move :: Integer -> Action
+        move o = case (Vector.!!) chosen o of
+                   Just i  -> action
+                                ((Vector.!!) outq o).enq ((Vector.select inq i).first)
+                                ((Vector.!!) turn o) := wrap5 (zeroExtend i + 1)
+                   Nothing -> noAction
+
+        release :: Integer -> Action
+        release i = if granted i then ((Vector.!!) inq i).deq else noAction
+
+    rules
+      -- 按输出口入队、按输入口出队分开写：同一个方法在一条规则里只调一次
+      "switch": when True ==> action
+          List.joinActions (List.map move (List.upto 0 4))
+          List.joinActions (List.map release (List.upto 0 4))
+
+    interface
+      inp  = Vector.map (\ q -> toPut (guarded q)) inq
+      outp = Vector.map (\ q -> toGet (guarded q)) outq
+
+interface Network n dw =
+    inject  :: Vector.Vector n (Put (Pkt dw))
+    deliver :: Vector.Vector n (Get (Pkt dw))
+
+mkNetwork :: (IsModule m c, Topology t, Bits (Pkt dw) pw) => t -> m (Network n dw)
+mkNetwork topo =
+  module
+    let count :: Integer
+        count = valueOf n
+
+    -- 类型里写的节点数与拓扑算出来的对不上，连错在编译期就报
+    rs :: Vector.Vector n (Router dw) <-
+      if nodes topo /= count
+      then error ("NoC: the topology has " +++ integerToString (nodes topo)
+                  +++ " nodes, the network was declared with " +++ integerToString count)
+      else Vector.genWithM (mkRouter topo)
+
+    let link i d =
+          case neighbour topo i d of
+            Just j  -> do
+                         _ <- mkConnection ((Vector.!!) ((Vector.!!) rs i).outp (dirIndex d))
+                                           ((Vector.!!) ((Vector.!!) rs j).inp (dirIndex (opposite d)))
+                         return ()
+            Nothing -> return ()
+
+    List.mapM_ (\ i -> List.mapM_ (link i) (Cons North (Cons East (Cons South (Cons West Nil)))))
+               (List.upto 0 (count - 1))
+
+    interface
+      inject  = Vector.map (\ r -> (Vector.!!) r.inp 0) rs
+      deliver = Vector.map (\ r -> (Vector.!!) r.outp 0) rs
