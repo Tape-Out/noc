@@ -15,7 +15,7 @@ deps:
 area:
   probe:
     module: mkMeshProbe
-    src: tb/Probe.bsv
+    src: htest/Probe.bsv
     check: true
   base:
     fixed: 29655.47
